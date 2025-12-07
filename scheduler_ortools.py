@@ -1,101 +1,230 @@
 from ortools.sat.python import cp_model
-from collections import defaultdict
-from models import Aula, DIAS_SEMANA
+from models import Aula, DIAS_SEMANA, HORARIOS_EFII, HORARIOS_EM, HORARIOS_REAIS
 import streamlit as st
 
 class GradeHorariaORTools:
-    def __init__(self, turmas, professores, disciplinas, relaxar_horario_ideal=False):
+    def __init__(self, turmas, professores, disciplinas, salas, dias_em_estendido=None):
         self.turmas = turmas
         self.professores = professores
-        self.disciplinas = {d.nome: d for d in disciplinas}
-        self.dias = DIAS_SEMANA  # 7 dias: dom a sab
-        self.horarios = [1, 2, 3, 4, 5, 6, 7]  # Inclui recreio (horário 4)
+        self.disciplinas = disciplinas
+        self.salas = salas
+        self.dias_em_estendido = dias_em_estendido or []
+        
         self.model = cp_model.CpModel()
         self.solver = cp_model.CpSolver()
-        self.solver.parameters.max_time_in_seconds = 10.0
-        self.relaxar_horario_ideal = relaxar_horario_ideal
-        self.turma_idx = {t.nome: i for i, t in enumerate(turmas)}
-        self.disciplinas_por_turma = self._disciplinas_por_turma()
-        self.variaveis = {}
-        self.atribuicoes_prof = {}
-        self._preparar_dados()
-        self._criar_variaveis()
-        self._adicionar_restricoes()
-
-    def _disciplinas_por_turma(self):
-        dp = defaultdict(list)
-        for turma in self.turmas:
-            for nome_disc, disc in self.disciplinas.items():
-                if turma.serie in disc.series:
-                    for _ in range(disc.carga_semanal):
-                        dp[turma.nome].append(nome_disc)
-        return dp
-
-    def _preparar_dados(self):
-        for turma_nome, disciplinas in self.disciplinas_por_turma.items():
-            for disc_nome in set(disciplinas):
-                for dia in self.dias:
-                    for horario in self.horarios:
-                        profs_validos = [
-                            p.nome for p in self.professores
-                            if disc_nome in p.disciplinas and dia in p.disponibilidade
-                        ]
-                        if profs_validos:
-                            self.atribuicoes_prof[(turma_nome, disc_nome, dia, horario)] = profs_validos
-
-    def _criar_variaveis(self):
-        for (turma, disc, dia, horario), profs in self.atribuicoes_prof.items():
-            for prof in profs:
-                var = self.model.NewBoolVar(f'aula_{turma}_{disc}_{dia}_{horario}_{prof}')
-                self.variaveis[(turma, disc, dia, horario, prof)] = var
-
-    def _adicionar_restricoes(self):
-        # 1. Cada aula pendente deve ser atribuída exatamente uma vez
-        for turma_nome, disciplinas in self.disciplinas_por_turma.items():
-            disc_contagem = defaultdict(int)
-            for d in disciplinas:
-                disc_contagem[d] += 1
-            for disc_nome, total in disc_contagem.items():
-                vars_disc = []
-                for dia in self.dias:
-                    for horario in self.horarios:
-                        if (turma_nome, disc_nome, dia, horario) in [
-                            (t, d, di, h) for (t, d, di, h) in self.atribuicoes_prof.keys()
-                        ]:
-                            for prof in self.atribuicoes_prof.get((turma_nome, disc_nome, dia, horario), []):
-                                vars_disc.append(self.variaveis[(turma_nome, disc_nome, dia, horario, prof)])
-                if vars_disc:
-                    self.model.Add(sum(vars_disc) == total)
-
-        # 2. Um professor não pode dar duas aulas ao mesmo tempo
-        for prof in self.professores:
-            for dia in self.dias:
-                for horario in self.horarios:
-                    vars_prof = []
-                    for (t, d, di, h, p), var in self.variaveis.items():
-                        if p == prof.nome and di == dia and h == horario:
-                            vars_prof.append(var)
-                    if len(vars_prof) > 1:
-                        self.model.Add(sum(vars_prof) <= 1)
-
-        # 3. Uma turma não pode ter duas aulas ao mesmo tempo
-        for turma in self.turmas:
-            for dia in self.dias:
-                for horario in self.horarios:
-                    vars_turma = []
-                    for (t, d, di, h, p), var in self.variaveis.items():
-                        if t == turma.nome and di == dia and h == horario:
-                            vars_turma.append(var)
-                    if len(vars_turma) > 1:
-                        self.model.Add(sum(vars_turma) <= 1)
-
-    def resolver(self):
-        status = self.solver.Solve(self.model)
-        aulas = []
-        if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
-            for (turma, disc, dia, horario, prof), var in self.variaveis.items():
-                if self.solver.Value(var) == 1:
-                    aulas.append(Aula(turma, disc, prof, dia, horario, "Sala 1"))
+        
+        # Variáveis de decisão
+        self.aulas_vars = {}  # (turma, disciplina, dia, horario) -> (professor, sala)
+        
+    def obter_segmento_turma(self, turma_nome):
+        """Determina o segmento da turma"""
+        if 'em' in turma_nome.lower():
+            return "EM"
         else:
-            raise Exception("Nenhuma solução viável encontrada pelo OR-Tools")
+            return "EF_II"
+    
+    def obter_horarios_turma(self, turma_nome):
+        """Retorna horários disponíveis para a turma"""
+        segmento = self.obter_segmento_turma(turma_nome)
+        if segmento == "EM":
+            return HORARIOS_EM
+        else:
+            return HORARIOS_EFII
+    
+    def obter_horario_real(self, turma_nome, horario):
+        """Retorna o horário real formatado"""
+        segmento = self.obter_segmento_turma(turma_nome)
+        return HORARIOS_REAIS[segmento].get(horario, "")
+    
+    def gerar_grade(self):
+        """Gera a grade horária usando OR-Tools"""
+        try:
+            self._criar_variaveis()
+            self._adicionar_restricoes()
+            
+            # Resolver
+            status = self.solver.Solve(self.model)
+            
+            if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+                return self._extrair_solucao()
+            else:
+                st.error(f"❌ Não foi possível encontrar solução. Status: {status}")
+                return None
+                
+        except Exception as e:
+            st.error(f"❌ Erro no OR-Tools: {str(e)}")
+            return None
+    
+    def _criar_variaveis(self):
+        """Cria variáveis de decisão"""
+        for turma in self.turmas:
+            turma_nome = turma.nome
+            grupo_turma = turma.grupo
+            horarios_turma = self.obter_horarios_turma(turma_nome)
+            
+            # Disciplinas desta turma (do mesmo grupo)
+            disciplinas_turma = []
+            for disc in self.disciplinas:
+                if turma_nome in disc.turmas and disc.grupo == grupo_turma:
+                    disciplinas_turma.append(disc)
+            
+            for disc in disciplinas_turma:
+                for dia in DIAS_SEMANA:
+                    for horario in horarios_turma:
+                        # Verificar se é horário de intervalo
+                        if self._eh_horario_intervalo(turma_nome, horario):
+                            continue
+                            
+                        # Professores que podem lecionar esta disciplina
+                        professores_validos = []
+                        for prof in self.professores:
+                            if (disc.nome in prof.disciplinas and 
+                                prof.grupo in [grupo_turma, "AMBOS"] and
+                                self._professor_disponivel(prof, dia, horario)):
+                                professores_validos.append(prof.nome)
+                        
+                        # Salas disponíveis
+                        salas_validas = [sala.nome for sala in self.salas]
+                        
+                        if professores_validos and salas_validas:
+                            key = (turma_nome, disc.nome, dia, horario)
+                            self.aulas_vars[key] = {
+                                'professor': self.model.NewIntVar(0, len(professores_validos)-1, f'prof_{key}'),
+                                'sala': self.model.NewIntVar(0, len(salas_validas)-1, f'sala_{key}'),
+                                'professores_list': professores_validos,
+                                'salas_list': salas_validas
+                            }
+    
+    def _eh_horario_intervalo(self, turma_nome, horario):
+        """Verifica se é horário de intervalo"""
+        segmento = self.obter_segmento_turma(turma_nome)
+        if segmento == "EF_II":
+            return horario == 3  # EF II: intervalo no 3º horário
+        elif segmento == "EM":
+            return horario == 4  # EM: intervalo no 4º horário
+        return False
+    
+    def _professor_disponivel(self, professor, dia, horario):
+        """Verifica se professor está disponível no horário"""
+        # Converter dia para formato completo para compatibilidade
+        dia_completo = self._converter_dia_para_completo(dia)
+        
+        # Verificar disponibilidade no dia
+        if dia_completo not in professor.disponibilidade:
+            return False
+        
+        # Verificar horários indisponíveis
+        horario_key = f"{dia}_{horario}"
+        return horario_key not in professor.horarios_indisponiveis
+    
+    def _converter_dia_para_completo(self, dia):
+        """Converte dia abreviado para completo"""
+        mapping = {
+            "seg": "segunda", "ter": "terca", "qua": "quarta",
+            "qui": "quinta", "sex": "sexta"
+        }
+        return mapping.get(dia, dia)
+    
+    def _adicionar_restricoes(self):
+        """Adiciona restrições ao modelo"""
+        self._adicionar_restricao_uma_aula_por_turma_horario()
+        self._adicionar_restricao_professor_uma_aula_por_horario()
+        self._adicionar_restricao_sala_uma_aula_por_horario()
+        self._adicionar_restricao_carga_horaria()
+    
+    def _adicionar_restricao_uma_aula_por_turma_horario(self):
+        """Cada turma tem no máximo uma aula por horário"""
+        for turma in self.turmas:
+            turma_nome = turma.nome
+            horarios_turma = self.obter_horarios_turma(turma_nome)
+            
+            for dia in DIAS_SEMANA:
+                for horario in horarios_turma:
+                    aulas_no_horario = []
+                    for key in self.aulas_vars:
+                        if key[0] == turma_nome and key[2] == dia and key[3] == horario:
+                            aulas_no_horario.append(1)  # Usar constante 1 para indicar presença
+                    
+                    if aulas_no_horario:
+                        self.model.Add(sum(aulas_no_horario) <= 1)
+    
+    def _adicionar_restricao_professor_uma_aula_por_horario(self):
+        """Cada professor tem no máximo uma aula por horário"""
+        for prof in self.professores:
+            for dia in DIAS_SEMANA:
+                for horario in range(1, 8):  # Todos horários possíveis 1-7
+                    aulas_prof = []
+                    for key, var_info in self.aulas_vars.items():
+                        if (key[2] == dia and key[3] == horario and 
+                            prof.nome in var_info['professores_list']):
+                            # Adicionar variável indicadora se este professor foi escolhido
+                            prof_index = var_info['professores_list'].index(prof.nome)
+                            aulas_prof.append(var_info['professor'] == prof_index)
+                    
+                    if aulas_prof:
+                        self.model.Add(sum(aulas_prof) <= 1)
+    
+    def _adicionar_restricao_sala_uma_aula_por_horario(self):
+        """Cada sala tem no máximo uma aula por horário"""
+        for sala in self.salas:
+            sala_nome = sala.nome
+            for dia in DIAS_SEMANA:
+                for horario in range(1, 8):
+                    aulas_sala = []
+                    for key, var_info in self.aulas_vars.items():
+                        if (key[2] == dia and key[3] == horario and
+                            sala_nome in var_info['salas_list']):
+                            sala_index = var_info['salas_list'].index(sala_nome)
+                            aulas_sala.append(var_info['sala'] == sala_index)
+                    
+                    if aulas_sala:
+                        self.model.Add(sum(aulas_sala) <= 1)
+    
+    def _adicionar_restricao_carga_horaria(self):
+        """Garante que cada disciplina tenha sua carga horária atendida"""
+        for turma in self.turmas:
+            turma_nome = turma.nome
+            grupo_turma = turma.grupo
+            
+            for disc in self.disciplinas:
+                if turma_nome in disc.turmas and disc.grupo == grupo_turma:
+                    aulas_disc = []
+                    for key in self.aulas_vars:
+                        if key[0] == turma_nome and key[1] == disc.nome:
+                            aulas_disc.append(1)  # Constante 1 para cada aula
+                    
+                    if aulas_disc:
+                        self.model.Add(sum(aulas_disc) == disc.carga_semanal)
+    
+    def _extrair_solucao(self):
+        """Extrai a solução do solver"""
+        aulas = []
+        
+        for key, var_info in self.aulas_vars.items():
+            turma_nome, disc_nome, dia, horario = key
+            
+            prof_index = self.solver.Value(var_info['professor'])
+            sala_index = self.solver.Value(var_info['sala'])
+            
+            professor = var_info['professores_list'][prof_index]
+            sala = var_info['salas_list'][sala_index]
+            
+            # Obter grupo da turma
+            turma_grupo = next((t.grupo for t in self.turmas if t.nome == turma_nome), "A")
+            
+            # Obter horário real
+            horario_real = self.obter_horario_real(turma_nome, horario)
+            
+            aula = Aula(
+                turma=turma_nome,
+                dia=dia,
+                horario=horario,
+                horario_real=horario_real,
+                disciplina=disc_nome,
+                professor=professor,
+                sala=sala,
+                grupo=turma_grupo
+            )
+            aulas.append(aula)
+        
         return aulas
